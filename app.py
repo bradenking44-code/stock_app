@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import date, timedelta
 import math
+import time
 
 # -- Page configuration ----------------------------------
 # st.set_page_config must be the FIRST Streamlit command in the script.
@@ -28,18 +29,54 @@ ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
 # ensures the cache expires after one hour so data stays fresh.
 @st.cache_data(show_spinner="Fetching data...", ttl=3600)
 def load_data(ticker: str) -> pd.DataFrame:
-    """Download the most recent year of daily data from Yahoo Finance."""
+    """Download the most recent year of daily data from Yahoo Finance with retries.
+
+    Uses exponential backoff on rate-limit errors and falls back to
+    `yf.Ticker(ticker).history()` if `yf.download` returns empty.
+    """
     end = date.today()
     start = end - timedelta(days=365)
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    return df
+
+    max_attempts = 5
+    backoff = 1
+    last_exc = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            df = yf.download(ticker, start=start, end=end, progress=False)
+
+            if df.empty:
+                t = yf.Ticker(ticker)
+                df2 = t.history(start=start, end=end, interval="1d")
+                if isinstance(df2, pd.DataFrame) and not df2.empty:
+                    df = df2
+
+            return df
+
+        except Exception as e:
+            last_exc = e
+            msg = str(e).lower()
+            if "rate" in msg or "too many requests" in msg or "rate limit" in msg or e.__class__.__name__ == "YFRateLimitError":
+                if attempt < max_attempts:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            raise
+
+    raise last_exc or RuntimeError("Failed to download data")
 
 # -- Main logic -------------------------------------------
 if ticker:
     try:
         df = load_data(ticker)
     except Exception as e:
-        st.error(f"Failed to download data: {e}")
+        msg = str(e).lower()
+        if "rate" in msg or "too many requests" in msg or "rate limit" in msg or e.__class__.__name__ == "YFRateLimitError":
+            st.error(
+                "Yahoo Finance rate limit reached. Please wait a few minutes and try again."
+            )
+        else:
+            st.error(f"Failed to download data: {e}")
         st.stop()
 
     if df.empty:
