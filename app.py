@@ -20,11 +20,7 @@ st.title("Stock Analysis Dashboard")
 # -- Sidebar: user inputs --------------------------------
 st.sidebar.header("Settings")
 
-with st.sidebar.form("input_form"):
-    ticker_input = st.text_input("Stock Ticker", value="AAPL")
-    submit = st.form_submit_button("Analyze")
-
-ticker = ticker_input.upper().strip()
+ticker = st.sidebar.text_input("Stock Ticker", value="SPY").upper().strip()
 
 # -- Data download ----------------------------------------
 # We wrap the download in st.cache_data so repeated runs with
@@ -39,7 +35,7 @@ def load_data(ticker: str) -> pd.DataFrame:
     return df
 
 # -- Main logic -------------------------------------------
-if submit and ticker:
+if ticker:
     try:
         df = load_data(ticker)
     except Exception as e:
