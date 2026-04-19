@@ -96,8 +96,11 @@ risk_free_rate = st.sidebar.number_input(
 ) / 100
 
 # Rolling volatility window
-vol_window = st.sidebar.slider(
-    "Rolling Volatility Window (days)", min_value=10, max_value=120, value=30, step=5
+vol_window = st.sidebar.selectbox(
+    "Rolling Volatility Window (days)",
+    options=[30, 60, 90],
+    index=0,
+    help="Select the rolling window length used to compute annualized volatility."
 )
 
 # -- Data download ----------------------------------------
@@ -232,8 +235,51 @@ if tickers:
     if not tickers:
         st.stop()
 
+    # Handle partial data: truncate to overlapping date range
+    if tickers:
+        # Find the overlapping date range
+        start_dates = [all_data[ticker].index.min() for ticker in tickers]
+        end_dates = [all_data[ticker].index.max() for ticker in tickers]
+        overlap_start = max(start_dates)
+        overlap_end = min(end_dates)
+        
+        original_range_days = (end_date - start_date).days
+        overlap_range_days = (overlap_end - overlap_start).days if overlap_end >= overlap_start else 0
+        
+        if overlap_range_days < original_range_days * 0.95:  # If overlap is less than 95% of original
+            st.warning(
+                f"Data truncated to overlapping period: {overlap_start.date()} to {overlap_end.date()} "
+                f"({overlap_range_days} days). Some tickers have partial data in the selected range."
+            )
+        
+        # Truncate all dataframes to the overlapping range
+        for ticker in list(all_data.keys()):
+            all_data[ticker] = all_data[ticker].loc[overlap_start:overlap_end]
+            # Check for missing values in the truncated range
+            missing_pct = all_data[ticker]["Adj Close"].isnull().mean()
+            if missing_pct > 0.05:  # More than 5% missing
+                st.warning(f"Dropping {ticker}: {missing_pct:.1%} of data is missing in the analysis period.")
+                del all_data[ticker]
+                if ticker in tickers:
+                    tickers.remove(ticker)
+                if ticker == "^GSPC":
+                    benchmark_df = None
+        
+        if not tickers:
+            st.error("No tickers remain after handling partial data. Please adjust your date range or ticker selection.")
+            st.stop()
+
     # Compute metrics for each ticker and benchmark
-    ticker_metrics = {}
+    @st.cache_data(show_spinner="Computing metrics...")
+    def compute_all_metrics(all_data, ma_window, vol_window, risk_free_rate):
+        ticker_metrics = {}
+        for ticker, df in all_data.items():
+            ticker_metrics[ticker] = compute_metrics(df, ticker, ma_window, vol_window, risk_free_rate)
+        return ticker_metrics
+    
+    ticker_metrics = compute_all_metrics(all_data, ma_window, vol_window, risk_free_rate)
+    
+    # Warn about MA window if needed
     for ticker, df in all_data.items():
         if ma_window > len(df):
             st.warning(
@@ -241,7 +287,6 @@ if tickers:
                 f"available data ({len(df)} trading days). The moving average "
                 "line won't appear — try a shorter window or a wider date range."
             )
-        ticker_metrics[ticker] = compute_metrics(df, ticker, ma_window, vol_window, risk_free_rate)
 
     # -- Summary Statistics Table --
     st.subheader("Summary Statistics")
@@ -321,6 +366,405 @@ if tickers:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Please select at least one stock to display the chart.")
+
+    st.divider()
+
+    # -- Daily Return Box Plot Comparison --
+    st.subheader("Daily Return Distribution - Box Plot")
+    if selected_tickers:
+        fig_box = go.Figure()
+        for ticker in selected_tickers:
+            returns = ticker_metrics[ticker]["df"]["Daily Return"].dropna()
+            fig_box.add_trace(
+                go.Box(
+                    y=returns,
+                    name=ticker,
+                    boxmean="sd",
+                    marker_color="mediumseagreen",
+                    line=dict(width=1)
+                )
+            )
+        fig_box.update_layout(
+            yaxis_title="Daily Return",
+            template="plotly_white",
+            boxmode="group",
+            height=450,
+            xaxis_title="Ticker"
+        )
+        st.plotly_chart(fig_box, use_container_width=True)
+
+        # -- Correlation Heatmap of Daily Returns --
+        st.divider()
+        st.subheader("Daily Return Correlation Heatmap")
+        returns_df = pd.concat(
+            [ticker_metrics[ticker]["df"]["Daily Return"] for ticker in selected_tickers],
+            axis=1,
+            keys=selected_tickers
+        )
+        returns_df = returns_df.dropna()
+        corr_matrix = returns_df.corr()
+
+        fig_corr = go.Figure(
+            data=go.Heatmap(
+                z=corr_matrix.values,
+                x=selected_tickers,
+                y=selected_tickers,
+                text=np.round(corr_matrix.values, 3),
+                texttemplate="%{text:.3f}",
+                colorscale="RdBu",
+                zmid=0,
+                zmin=-1,
+                zmax=1,
+                colorbar=dict(title="Correlation", ticks="outside")
+            )
+        )
+        fig_corr.update_layout(
+            xaxis_title="Ticker",
+            yaxis_title="Ticker",
+            template="plotly_white",
+            height=500
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
+    else:
+        st.info("Please select at least one stock to display the box plot.")
+
+    st.divider()
+
+    # -- Scatter Plot of Two Stocks' Daily Returns --
+    st.subheader("Scatter Plot of Daily Returns for Two Stocks")
+    if len(selected_tickers) >= 2:
+        scatter_tickers = st.multiselect(
+            "Select exactly two stocks to compare:",
+            options=selected_tickers,
+            default=selected_tickers[:2],
+            max_selections=2,
+            key="scatter_stock_selector"
+        )
+        if len(scatter_tickers) == 2:
+            returns1 = ticker_metrics[scatter_tickers[0]]["df"]["Daily Return"].dropna()
+            returns2 = ticker_metrics[scatter_tickers[1]]["df"]["Daily Return"].dropna()
+            combined_returns = pd.concat([returns1, returns2], axis=1, keys=scatter_tickers).dropna()
+
+            fig_scatter = go.Figure()
+            fig_scatter.add_trace(
+                go.Scatter(
+                    x=combined_returns[scatter_tickers[0]],
+                    y=combined_returns[scatter_tickers[1]],
+                    mode="markers",
+                    name=f"{scatter_tickers[0]} vs {scatter_tickers[1]}",
+                    marker=dict(color="darkorange", size=4, opacity=0.6)
+                )
+            )
+            fig_scatter.update_layout(
+                xaxis_title=f"{scatter_tickers[0]} Daily Return",
+                yaxis_title=f"{scatter_tickers[1]} Daily Return",
+                template="plotly_white",
+                height=500
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        else:
+            st.info("Please select exactly two stocks to display the scatter plot.")
+    else:
+        st.info("Select at least two stocks to enable scatter plot comparison.")
+
+    st.divider()
+
+    # -- Rolling Correlation Plot --
+    st.subheader("Rolling Correlation of Daily Returns")
+    if len(selected_tickers) >= 2:
+        roll_corr_tickers = st.multiselect(
+            "Select exactly two stocks for rolling correlation:",
+            options=selected_tickers,
+            default=selected_tickers[:2],
+            max_selections=2,
+            key="rolling_corr_stock_selector"
+        )
+        roll_window = st.slider(
+            "Rolling Window Length (days)",
+            min_value=10,
+            max_value=120,
+            value=30,
+            step=5,
+            key="rolling_corr_window"
+        )
+        if len(roll_corr_tickers) == 2:
+            returns1 = ticker_metrics[roll_corr_tickers[0]]["df"]["Daily Return"]
+            returns2 = ticker_metrics[roll_corr_tickers[1]]["df"]["Daily Return"]
+            combined_returns = pd.concat([returns1, returns2], axis=1, keys=roll_corr_tickers)
+            rolling_corr = combined_returns[roll_corr_tickers[0]].rolling(window=roll_window).corr(combined_returns[roll_corr_tickers[1]])
+
+            fig_roll_corr = go.Figure()
+            fig_roll_corr.add_trace(
+                go.Scatter(
+                    x=combined_returns.index,
+                    y=rolling_corr,
+                    mode="lines",
+                    name=f"Rolling Correlation ({roll_window}-day)",
+                    line=dict(color="purple", width=2)
+                )
+            )
+            fig_roll_corr.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_roll_corr.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Rolling Correlation",
+                template="plotly_white",
+                height=500
+            )
+            st.plotly_chart(fig_roll_corr, use_container_width=True)
+        else:
+            st.info("Please select exactly two stocks to display the rolling correlation.")
+    else:
+        st.info("Select at least two stocks to enable rolling correlation analysis.")
+
+    st.divider()
+
+    # -- Two-Asset Portfolio Explorer --
+    st.subheader("Two-Asset Portfolio Explorer")
+    if len(selected_tickers) >= 2:
+        port_tickers = st.multiselect(
+            "Select exactly two stocks for portfolio analysis:",
+            options=selected_tickers,
+            default=selected_tickers[:2],
+            max_selections=2,
+            key="portfolio_stock_selector"
+        )
+        if len(port_tickers) == 2:
+            stock_a, stock_b = port_tickers[0], port_tickers[1]
+            metrics_a = ticker_metrics[stock_a]
+            metrics_b = ticker_metrics[stock_b]
+
+            # Get annualized returns and volatilities
+            ret_a = metrics_a["ann_return"]
+            ret_b = metrics_b["ann_return"]
+            vol_a = metrics_a["ann_volatility"]
+            vol_b = metrics_b["ann_volatility"]
+
+            # Correlation
+            returns_a = metrics_a["df"]["Daily Return"].dropna()
+            returns_b = metrics_b["df"]["Daily Return"].dropna()
+            combined = pd.concat([returns_a, returns_b], axis=1, keys=[stock_a, stock_b]).dropna()
+            corr = combined[stock_a].corr(combined[stock_b])
+
+            # Slider for weight on Stock A
+            weight_a = st.slider(
+                f"Weight on {stock_a} (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=50.0,
+                step=1.0,
+                key="portfolio_weight_slider"
+            ) / 100
+            weight_b = 1 - weight_a
+
+            # Portfolio metrics
+            port_ret = weight_a * ret_a + weight_b * ret_b
+            port_vol = math.sqrt(
+                weight_a**2 * vol_a**2 +
+                weight_b**2 * vol_b**2 +
+                2 * weight_a * weight_b * vol_a * vol_b * corr
+            )
+
+            # Display current portfolio metrics
+            col1, col2 = st.columns(2)
+            col1.metric("Portfolio Annualized Return", f"{port_ret:.2%}")
+            col2.metric("Portfolio Annualized Volatility", f"{port_vol:.2%}")
+
+            # Volatility curve chart
+            weights = np.linspace(0, 1, 101)
+            port_vols = [
+                math.sqrt(
+                    w**2 * vol_a**2 +
+                    (1-w)**2 * vol_b**2 +
+                    2 * w * (1-w) * vol_a * vol_b * corr
+                ) for w in weights
+            ]
+
+            fig_port = go.Figure()
+            fig_port.add_trace(
+                go.Scatter(
+                    x=weights * 100,
+                    y=port_vols,
+                    mode="lines",
+                    name="Portfolio Volatility",
+                    line=dict(color="blue", width=2)
+                )
+            )
+            # Mark current position
+            fig_port.add_trace(
+                go.Scatter(
+                    x=[weight_a * 100],
+                    y=[port_vol],
+                    mode="markers",
+                    name="Current Weight",
+                    marker=dict(color="red", size=10, symbol="circle")
+                )
+            )
+            # Individual volatilities
+            fig_port.add_hline(y=vol_a, line_dash="dash", line_color="green", annotation_text=f"{stock_a} Vol: {vol_a:.1%}")
+            fig_port.add_hline(y=vol_b, line_dash="dash", line_color="orange", annotation_text=f"{stock_b} Vol: {vol_b:.1%}")
+
+            fig_port.update_layout(
+                xaxis_title="Weight on Stock A (%)",
+                yaxis_title="Annualized Volatility",
+                template="plotly_white",
+                height=500
+            )
+            st.plotly_chart(fig_port, use_container_width=True)
+
+            # Description
+            st.caption(
+                "This chart demonstrates the diversification effect: by combining two stocks, the portfolio's volatility "
+                "can be lower than either stock's individual volatility when their correlation is less than 1. "
+                "The minimum volatility point shows the optimal weight for risk minimization."
+            )
+        else:
+            st.info("Please select exactly two stocks for portfolio analysis.")
+    else:
+        st.info("Select at least two stocks to enable portfolio exploration.")
+
+    st.divider()
+
+    # -- Distribution Plot / Q-Q Plot for Selected Stock --
+    st.subheader("Return Distribution Analysis for Selected Stock")
+    dist_ticker = st.selectbox(
+        "Choose a stock to analyze return distribution:",
+        options=tickers,
+        index=0,
+        key="distribution_stock_selector"
+    )
+
+    dist_df = ticker_metrics[dist_ticker]["df"]
+    dist_returns = dist_df["Daily Return"].dropna()
+
+    if len(dist_returns) > 0:
+        tabs = st.tabs(["Histogram", "Q-Q Plot"])
+        mu, sigma = stats.norm.fit(dist_returns)
+        x_range = np.linspace(float(dist_returns.min()), float(dist_returns.max()), 200)
+        norm_pdf = stats.norm.pdf(x_range, mu, sigma)
+
+        with tabs[0]:
+            fig_hist = go.Figure()
+            fig_hist.add_trace(
+                go.Histogram(
+                    x=dist_returns,
+                    nbinsx=60,
+                    marker_color="mediumpurple",
+                    opacity=0.75,
+                    name="Daily Returns",
+                    histnorm="probability density"
+                )
+            )
+            fig_hist.add_trace(
+                go.Scatter(
+                    x=x_range,
+                    y=norm_pdf,
+                    mode="lines",
+                    name="Fitted Normal PDF",
+                    line=dict(color="red", width=2)
+                )
+            )
+            fig_hist.update_layout(
+                xaxis_title="Daily Return",
+                yaxis_title="Density",
+                template="plotly_white",
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+            st.caption(f"Fitted normal distribution parameters: mu = {mu:.6f}, sigma = {sigma:.6f}")
+
+        with tabs[1]:
+            (osm, osr), (slope, intercept, r) = stats.probplot(dist_returns, dist="norm")
+            qq_line = intercept + slope * osm
+
+            fig_qq = go.Figure()
+            fig_qq.add_trace(
+                go.Scatter(
+                    x=osm,
+                    y=osr,
+                    mode="markers",
+                    name="Sample Quantiles",
+                    marker=dict(color="darkblue", size=5, opacity=0.7)
+                )
+            )
+            fig_qq.add_trace(
+                go.Scatter(
+                    x=osm,
+                    y=qq_line,
+                    mode="lines",
+                    name="Theoretical Normal Line",
+                    line=dict(color="red", width=2)
+                )
+            )
+            fig_qq.update_layout(
+                xaxis_title="Theoretical Quantiles",
+                yaxis_title="Sample Quantiles",
+                template="plotly_white",
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_qq, use_container_width=True)
+            st.caption(f"Q-Q line: slope = {slope:.4f}, intercept = {intercept:.4f}, R = {r:.4f}")
+
+        jb_stat, jb_pvalue = stats.jarque_bera(dist_returns)
+        normality_message = (
+            "Fails to reject normality (p >= 0.05)"
+            if jb_pvalue >= 0.05
+            else "Rejects normality (p < 0.05)"
+        )
+        st.caption(
+            f"Jarque-Bera test: statistic = {jb_stat:.2f}, p-value = {jb_pvalue:.4f} — {normality_message}"
+        )
+    else:
+        st.info("Not enough return data to generate a distribution plot.")
+
+    st.divider()
+
+    # -- Rolling Annualized Volatility Comparison Chart --
+    st.subheader("Rolling Annualized Volatility")
+    if selected_tickers:
+        fig_vol = go.Figure()
+        for ticker in selected_tickers:
+            df = ticker_metrics[ticker]["df"]
+            fig_vol.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df["Rolling Volatility"],
+                    mode="lines",
+                    name=ticker,
+                    line=dict(width=2)
+                )
+            )
+
+        if "^GSPC" in ticker_metrics:
+            benchmark_df = ticker_metrics["^GSPC"]["df"]
+            fig_vol.add_trace(
+                go.Scatter(
+                    x=benchmark_df.index,
+                    y=benchmark_df["Rolling Volatility"],
+                    mode="lines",
+                    name="S&P 500 (^GSPC)",
+                    line=dict(width=2, dash="dot", color="gray")
+                )
+            )
+
+        fig_vol.update_layout(
+            yaxis_title="Annualized Volatility",
+            yaxis_tickformat=".1%",
+            xaxis_title="Date",
+            template="plotly_white",
+            height=500,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
+        )
+        st.plotly_chart(fig_vol, use_container_width=True)
+    else:
+        st.info("Please select at least one stock to display volatility comparison.")
 
     st.divider()
 
